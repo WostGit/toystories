@@ -36,23 +36,25 @@ jobs:
           sysctl -n hw.ncpu || true
           python3 --version
 
-      - name: Install MLX dependencies
+      - name: Create virtual environment and install MLX dependencies
         run: |
           set -eux
-          python3 -m pip install --upgrade pip
-          python3 -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel
+          .venv/bin/python -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm
 
       - name: Version info
         run: |
           set -eux
-          python3 - <<'PY'
+          .venv/bin/python --version
+          .venv/bin/python - <<'PY'
           import platform
           import mlx.core as mx
           print("platform=", platform.platform())
           print("mlx_default_device=", mx.default_device())
           PY
-          python3 -m mlx_lm.generate --help | sed -n '1,80p'
-          python3 -m mlx_lm.benchmark --help | sed -n '1,120p'
+          .venv/bin/python -m mlx_lm.generate --help | sed -n '1,80p'
+          .venv/bin/python -m mlx_lm.benchmark --help | sed -n '1,120p'
 
       - name: Create custom benchmark script
         run: |
@@ -122,7 +124,7 @@ jobs:
       - name: Benchmark SmolLM 135M base with mlx_lm.benchmark
         run: |
           set -eux
-          python3 -m mlx_lm.benchmark \
+          .venv/bin/python -m mlx_lm.benchmark \
             --model mlx-community/SmolLM-135M-4bit \
             -p "${{ github.event.inputs.prompt_tokens }}" \
             -g "${{ github.event.inputs.generation_tokens }}" \
@@ -131,7 +133,7 @@ jobs:
       - name: Benchmark SmolLM 135M Instruct with mlx_lm.benchmark
         run: |
           set -eux
-          python3 -m mlx_lm.benchmark \
+          .venv/bin/python -m mlx_lm.benchmark \
             --model mlx-community/SmolLM-135M-Instruct-4bit \
             -p "${{ github.event.inputs.prompt_tokens }}" \
             -g "${{ github.event.inputs.generation_tokens }}" \
@@ -140,7 +142,7 @@ jobs:
       - name: Benchmark SmolLM 135M base with custom wall-clock script
         run: |
           set -eux
-          python3 bench_generate.py \
+          .venv/bin/python bench_generate.py \
             --model mlx-community/SmolLM-135M-4bit \
             --prompt "The future of computing is" \
             --max-tokens "${{ github.event.inputs.generation_tokens }}" \
@@ -150,7 +152,7 @@ jobs:
       - name: Benchmark SmolLM 135M Instruct with custom wall-clock script
         run: |
           set -eux
-          python3 bench_generate.py \
+          .venv/bin/python bench_generate.py \
             --model mlx-community/SmolLM-135M-Instruct-4bit \
             --prompt "Tell a short story about a robot." \
             --max-tokens "${{ github.event.inputs.generation_tokens }}" \
@@ -173,11 +175,11 @@ jobs:
         run: |
           set -eux
           if [ -f sample.py ]; then
-            python3 sample.py 2>&1 | tee ../nanogpt_sample_output.txt
+            ../.venv/bin/python sample.py 2>&1 | tee ../nanogpt_sample_output.txt
           elif [ -f generate.py ]; then
-            python3 generate.py 2>&1 | tee ../nanogpt_generate_output.txt
+            ../.venv/bin/python generate.py 2>&1 | tee ../nanogpt_generate_output.txt
           elif [ -f benchmark.py ]; then
-            python3 benchmark.py 2>&1 | tee ../nanogpt_benchmark_output.txt
+            ../.venv/bin/python benchmark.py 2>&1 | tee ../nanogpt_benchmark_output.txt
           else
             echo "No obvious sample.py/generate.py/benchmark.py found. See nanogpt_candidate_scripts.txt." | tee ../nanogpt_no_entrypoint.txt
           fi

@@ -166,8 +166,7 @@ jobs:
             --runs "$REPETITIONS" \
             2>&1 | tee smollm_135m_instruct_4bit_custom_benchmark.txt
 
-      - name: Inspect NanoGPT-on-MLX TinyStories candidate
-        continue-on-error: true
+      - name: Clone NanoGPT-on-MLX TinyStories candidate
         run: |
           set -eux
           git clone --depth 1 https://github.com/JackSuuu/nanoGPT-on-MLX.git nanogpt-on-mlx
@@ -176,20 +175,64 @@ jobs:
             \( -name '*bench*' -o -name '*sample*' -o -name '*generate*' -o -name '*.py' \) \
             -print | sort | tee nanogpt_candidate_scripts.txt
 
-      - name: Try NanoGPT TinyStories generation or benchmark scripts
-        continue-on-error: true
+      - name: Create random NanoGPT checkpoint
         working-directory: nanogpt-on-mlx
         run: |
           set -eux
-          if [ -f sample.py ]; then
-            ../.venv/bin/python sample.py 2>&1 | tee ../nanogpt_sample_output.txt
-          elif [ -f generate.py ]; then
-            ../.venv/bin/python generate.py 2>&1 | tee ../nanogpt_generate_output.txt
-          elif [ -f benchmark.py ]; then
-            ../.venv/bin/python benchmark.py 2>&1 | tee ../nanogpt_benchmark_output.txt
-          else
-            echo "No obvious sample.py/generate.py/benchmark.py found. See nanogpt_candidate_scripts.txt." | tee ../nanogpt_no_entrypoint.txt
-          fi
+          ../.venv/bin/python - <<'PY' 2>&1 | tee ../nanogpt_create_checkpoint.txt
+          import json
+          import os
+          import mlx.core as mx
+          from src import config as cfg
+          from src.model import create_model
+          from src.utils import count_parameters
+
+          config = {k: v for k, v in vars(cfg).items() if not k.startswith('_')}
+          os.makedirs('checkpoints', exist_ok=True)
+          model = create_model(config)
+
+          # Force lazy parameter initialization before saving.
+          x = mx.random.randint(0, config['vocab_size'], (1, 8))
+          logits, _ = model(x)
+          mx.eval(logits)
+
+          params = count_parameters(model)
+          checkpoint_path = 'checkpoints/checkpoint_0.npz'
+          model.save_weights(checkpoint_path)
+
+          with open('checkpoints/checkpoint_0_meta.json', 'w') as f:
+              json.dump({'iteration': 0, 'loss': 0.0, 'config': config, 'params': params}, f, indent=2)
+          with open('checkpoints/config.json', 'w') as f:
+              json.dump(config, f, indent=2)
+
+          print(f'NANOGPT_CHECKPOINT={checkpoint_path}')
+          print(f'NANOGPT_PARAMS={params}')
+          PY
+
+      - name: Run NanoGPT TinyStories generation
+        working-directory: nanogpt-on-mlx
+        run: |
+          set -eux
+          ../.venv/bin/python -m src.generate \
+            --checkpoint checkpoints/checkpoint_0.npz \
+            --prompt "Once upon a time" \
+            --max_tokens 64 \
+            --temperature 0.0 \
+            --top_k 1 \
+            2>&1 | tee ../nanogpt_generate_output.txt
+
+      - name: Benchmark NanoGPT TinyStories throughput
+        working-directory: nanogpt-on-mlx
+        run: |
+          set -eux
+          ../.venv/bin/python eval/throughput.py \
+            --checkpoint checkpoints/checkpoint_0.npz \
+            --batch_size 1 \
+            --seq_length 32 \
+            --iterations 5 \
+            --warmup 1 \
+            --generation \
+            2>&1 | tee ../nanogpt_throughput_output.txt
 
       - name: Summarize results
         if: always()
@@ -217,12 +260,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## NanoGPT TinyStories" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f nanogpt_candidate_scripts.txt ]; then
-            sed -n '1,80p' nanogpt_candidate_scripts.txt >> "$GITHUB_STEP_SUMMARY"
-          fi
-          if [ -f nanogpt_no_entrypoint.txt ]; then
-            cat nanogpt_no_entrypoint.txt >> "$GITHUB_STEP_SUMMARY"
-          fi
+          grep -hE 'NANOGPT_CHECKPOINT=|NANOGPT_PARAMS=|Throughput:|Generation Results|tok/s|tokens/sec' nanogpt_create_checkpoint.txt nanogpt_generate_output.txt nanogpt_throughput_output.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark artifacts

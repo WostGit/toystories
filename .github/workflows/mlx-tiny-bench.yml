@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       prompt_tokens:
-        description: Prompt tokens for mlx_lm.benchmark
+        description: Prompt tokens
         required: false
         default: "32"
       generation_tokens:
@@ -14,159 +14,172 @@ on:
         required: false
         default: "512"
       repetitions:
-        description: Custom benchmark repetitions
+        description: Repetitions
         required: false
         default: "5"
 
 jobs:
-  bench:
-    name: Benchmark MLX tiny models on macos-26
+  smollm:
+    name: SmolLM ${{ matrix.name }}
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: base-135m-4bit
+            model: mlx-community/SmolLM-135M-4bit
+            prompt: The future of computing is
+          - name: instruct-135m-4bit
+            model: mlx-community/SmolLM-135M-Instruct-4bit
+            prompt: Tell a short story about a robot.
     env:
       PROMPT_TOKENS: ${{ github.event.inputs.prompt_tokens || '32' }}
       GENERATION_TOKENS: ${{ github.event.inputs.generation_tokens || '512' }}
       REPETITIONS: ${{ github.event.inputs.repetitions || '5' }}
-
     steps:
       - uses: actions/checkout@v4
-
       - name: System info
         run: |
-          set -eux
           uname -a
           sw_vers
           sysctl -n machdep.cpu.brand_string || true
           sysctl -n hw.memsize || true
           sysctl -n hw.ncpu || true
-          python3 --version
-
-      - name: Install dependencies in venv
+      - name: Install MLX-LM
         run: |
           set -eux
           python3 -m venv .venv
           .venv/bin/python -m pip install --upgrade pip setuptools wheel
-          .venv/bin/python -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm datasets
-
-      - name: Create MLX-LM custom benchmark script
+          .venv/bin/python -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm
+      - name: Create custom generation benchmark
         run: |
           cat > bench_generate.py <<'PY'
-          import argparse
-          import statistics
-          import time
+          import argparse, statistics, time
           from mlx_lm import generate, load
-
-          parser = argparse.ArgumentParser()
-          parser.add_argument("--model", required=True)
-          parser.add_argument("--prompt", default="The future of computing is")
-          parser.add_argument("--max-tokens", type=int, default=512)
-          parser.add_argument("--runs", type=int, default=5)
-          args = parser.parse_args()
-
-          model, tokenizer = load(args.model)
-          generate(model, tokenizer, prompt=args.prompt, max_tokens=16, verbose=False)
-
+          p = argparse.ArgumentParser()
+          p.add_argument('--model', required=True)
+          p.add_argument('--prompt', required=True)
+          p.add_argument('--max-tokens', type=int, default=512)
+          p.add_argument('--runs', type=int, default=5)
+          a = p.parse_args()
+          model, tok = load(a.model)
+          generate(model, tok, prompt=a.prompt, max_tokens=16, verbose=False)
           speeds = []
-          for i in range(args.runs):
-              start = time.perf_counter()
-              text = generate(model, tokenizer, prompt=args.prompt, max_tokens=args.max_tokens, verbose=False)
-              elapsed = time.perf_counter() - start
-              tokens = len(tokenizer.encode(text))
-              tok_s = tokens / elapsed
-              speeds.append(tok_s)
-              print(f"run={i+1} output_tokens={tokens} seconds={elapsed:.4f} tok_s={tok_s:.2f}")
-
-          print(f"MODEL={args.model}")
-          print(f"BEST_TOK_S={max(speeds):.2f}")
-          print(f"AVG_TOK_S={statistics.mean(speeds):.2f}")
-          print(f"MEDIAN_TOK_S={statistics.median(speeds):.2f}")
+          for i in range(a.runs):
+              t0 = time.perf_counter()
+              out = generate(model, tok, prompt=a.prompt, max_tokens=a.max_tokens, verbose=False)
+              dt = time.perf_counter() - t0
+              n = len(tok.encode(out))
+              s = n / dt
+              speeds.append(s)
+              print(f'run={i+1} output_tokens={n} seconds={dt:.4f} tok_s={s:.2f}')
+          print(f'MODEL={a.model}')
+          print(f'BEST_TOK_S={max(speeds):.2f}')
+          print(f'AVG_TOK_S={statistics.mean(speeds):.2f}')
+          print(f'MEDIAN_TOK_S={statistics.median(speeds):.2f}')
           PY
-
-      - name: Benchmark SmolLM 135M base
+      - name: Run SmolLM benchmarks
         run: |
           set -eux
-          .venv/bin/python -m mlx_lm.benchmark --model mlx-community/SmolLM-135M-4bit -p "$PROMPT_TOKENS" -g "$GENERATION_TOKENS" 2>&1 | tee smollm_135m_4bit_mlx_lm_benchmark.txt
-          .venv/bin/python bench_generate.py --model mlx-community/SmolLM-135M-4bit --prompt "The future of computing is" --max-tokens "$GENERATION_TOKENS" --runs "$REPETITIONS" 2>&1 | tee smollm_135m_4bit_custom_benchmark.txt
+          .venv/bin/python -m mlx_lm.benchmark --model "${{ matrix.model }}" -p "$PROMPT_TOKENS" -g "$GENERATION_TOKENS" 2>&1 | tee mlx_lm_${{ matrix.name }}.txt
+          .venv/bin/python bench_generate.py --model "${{ matrix.model }}" --prompt "${{ matrix.prompt }}" --max-tokens "$GENERATION_TOKENS" --runs "$REPETITIONS" 2>&1 | tee custom_${{ matrix.name }}.txt
+      - name: Summarize SmolLM
+        if: always()
+        run: |
+          echo "# SmolLM ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -hE 'MODEL=|BEST_TOK_S=|AVG_TOK_S=|MEDIAN_TOK_S=|prompt|generation|tok|tokens|speed' *.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smollm-${{ matrix.name }}
+          path: "*.txt"
 
-      - name: Benchmark SmolLM 135M Instruct
+  nanogpt:
+    name: NanoGPT ${{ matrix.mode }}
+    runs-on: macos-26
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: generate-random-checkpoint
+            command: ../.venv/bin/python -m src.generate --checkpoint checkpoints/checkpoint_0.npz --prompt "Once upon a time" --max_tokens 64 --temperature 1.0 --top_k 1
+          - mode: throughput-random-checkpoint
+            command: ../.venv/bin/python eval/throughput.py --checkpoint checkpoints/checkpoint_0.npz --batch_size 1 --seq_length 32 --iterations 5 --warmup 1 --generation
+          - mode: full-benchmark-skip-perplexity
+            command: ../.venv/bin/python eval/benchmark.py --checkpoint checkpoints/checkpoint_0.npz --batch_size 1 --throughput_iters 5 --warmup 1 --skip_perplexity --output ../nanogpt_full_benchmark.json
+          - mode: training-speed-script
+            command: ../.venv/bin/python test/test_10M_speed.py
+    steps:
+      - uses: actions/checkout@v4
+      - name: System info
+        run: |
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.memsize || true
+          sysctl -n hw.ncpu || true
+      - name: Install dependencies
         run: |
           set -eux
-          .venv/bin/python -m mlx_lm.benchmark --model mlx-community/SmolLM-135M-Instruct-4bit -p "$PROMPT_TOKENS" -g "$GENERATION_TOKENS" 2>&1 | tee smollm_135m_instruct_4bit_mlx_lm_benchmark.txt
-          .venv/bin/python bench_generate.py --model mlx-community/SmolLM-135M-Instruct-4bit --prompt "Tell a short story about a robot." --max-tokens "$GENERATION_TOKENS" --runs "$REPETITIONS" 2>&1 | tee smollm_135m_instruct_4bit_custom_benchmark.txt
-
-      - name: Clone NanoGPT-on-MLX
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel
+          .venv/bin/python -m pip install --upgrade mlx numpy tiktoken tqdm datasets
+      - name: Clone NanoGPT-on-MLX and inspect all candidates
         run: |
           set -eux
           git clone --depth 1 https://github.com/JackSuuu/nanoGPT-on-MLX.git nanogpt-on-mlx
-          find nanogpt-on-mlx -maxdepth 3 -type f | sort | tee nanogpt_repo_files.txt
-
-      - name: Create random NanoGPT checkpoint
+          find nanogpt-on-mlx -maxdepth 3 -type f | sort | tee nanogpt_files_${{ matrix.mode }}.txt
+          find nanogpt-on-mlx -maxdepth 3 -type f \( -name '*bench*' -o -name '*speed*' -o -name '*generate*' -o -name '*.py' \) -print | sort | tee nanogpt_candidates_${{ matrix.mode }}.txt
+      - name: Create random checkpoint for checkpoint-based modes
         working-directory: nanogpt-on-mlx
         env:
           PYTHONPATH: ${{ github.workspace }}/nanogpt-on-mlx
         run: |
           set -eux
-          ../.venv/bin/python - <<'PY' 2>&1 | tee ../nanogpt_create_checkpoint.txt
-          import json
-          import os
+          ../.venv/bin/python - <<'PY' 2>&1 | tee ../nanogpt_checkpoint_${{ matrix.mode }}.txt
+          import json, os
           import mlx.core as mx
           from src import config as cfg
           from src.model import create_model
           from src.utils import count_parameters
-
-          config = {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
-          os.makedirs("checkpoints", exist_ok=True)
+          config = {k: v for k, v in vars(cfg).items() if not k.startswith('_')}
+          os.makedirs('checkpoints', exist_ok=True)
           model = create_model(config)
-          x = mx.random.randint(0, config["vocab_size"], (1, 8))
+          x = mx.random.randint(0, config['vocab_size'], (1, 8))
           logits, _ = model(x)
           mx.eval(logits)
           params = count_parameters(model)
-          checkpoint_path = "checkpoints/checkpoint_0.npz"
-          model.save_weights(checkpoint_path)
-          with open("checkpoints/checkpoint_0_meta.json", "w") as f:
-              json.dump({"iteration": 0, "loss": 0.0, "config": config, "params": params}, f, indent=2)
-          with open("checkpoints/config.json", "w") as f:
+          path = 'checkpoints/checkpoint_0.npz'
+          model.save_weights(path)
+          with open('checkpoints/checkpoint_0_meta.json', 'w') as f:
+              json.dump({'iteration': 0, 'loss': 0.0, 'config': config, 'params': params}, f, indent=2)
+          with open('checkpoints/config.json', 'w') as f:
               json.dump(config, f, indent=2)
-          print(f"NANOGPT_CHECKPOINT={checkpoint_path}")
-          print(f"NANOGPT_PARAMS={params}")
+          print(f'NANOGPT_CHECKPOINT={path}')
+          print(f'NANOGPT_PARAMS={params}')
           PY
-
-      - name: Run NanoGPT generation
+      - name: Run NanoGPT mode
         working-directory: nanogpt-on-mlx
         env:
           PYTHONPATH: ${{ github.workspace }}/nanogpt-on-mlx
         run: |
           set -eux
-          ../.venv/bin/python -m src.generate --checkpoint checkpoints/checkpoint_0.npz --prompt "Once upon a time" --max_tokens 64 --temperature 1.0 --top_k 1 2>&1 | tee ../nanogpt_generate_output.txt
-
-      - name: Benchmark NanoGPT throughput
-        working-directory: nanogpt-on-mlx
-        env:
-          PYTHONPATH: ${{ github.workspace }}/nanogpt-on-mlx
-        run: |
-          set -eux
-          ../.venv/bin/python eval/throughput.py --checkpoint checkpoints/checkpoint_0.npz --batch_size 1 --seq_length 32 --iterations 5 --warmup 1 --generation 2>&1 | tee ../nanogpt_throughput_output.txt
-
-      - name: Summarize results
+          ${{ matrix.command }} 2>&1 | tee ../nanogpt_run_${{ matrix.mode }}.txt
+      - name: Summarize NanoGPT
         if: always()
         run: |
-          set +e
-          echo "# MLX Tiny LLM Benchmark" >> "$GITHUB_STEP_SUMMARY"
-          echo "## SmolLM" >> "$GITHUB_STEP_SUMMARY"
+          echo "# NanoGPT ${{ matrix.mode }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -hE 'MODEL=|BEST_TOK_S=|AVG_TOK_S=|MEDIAN_TOK_S=' *_custom_benchmark.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
-          grep -hEi 'prompt|generation|tok|tokens|speed' *_mlx_lm_benchmark.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          grep -hE 'NANOGPT_CHECKPOINT=|NANOGPT_PARAMS=|Throughput:|Generation Results|tok/s|tokens/sec|Total time|Average per iteration|Results:|ERROR|Traceback' *.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "## NanoGPT" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -hE 'NANOGPT_CHECKPOINT=|NANOGPT_PARAMS=|Throughput:|Generation Results|tok/s|tokens/sec' nanogpt_create_checkpoint.txt nanogpt_generate_output.txt nanogpt_throughput_output.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload benchmark artifacts
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: mlx-tiny-llm-benchmark-results
+          name: nanogpt-${{ matrix.mode }}
           path: |
             *.txt
-            bench_generate.py
+            *.json

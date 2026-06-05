@@ -1,0 +1,226 @@
+name: MLX Tiny LLM Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt_tokens:
+        description: "Prompt token count for mlx_lm.benchmark"
+        required: false
+        default: "32"
+      generation_tokens:
+        description: "Generation token count for mlx_lm.benchmark/custom benchmark"
+        required: false
+        default: "512"
+      repetitions:
+        description: "Benchmark repetitions"
+        required: false
+        default: "5"
+
+jobs:
+  mlx-tiny-bench:
+    name: Benchmark tiny MLX models on macos-26
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          set -eux
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.memsize || true
+          sysctl -n hw.ncpu || true
+          python3 --version
+
+      - name: Install MLX dependencies
+        run: |
+          set -eux
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm
+
+      - name: Version info
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import platform
+          import mlx.core as mx
+          print("platform=", platform.platform())
+          print("mlx_default_device=", mx.default_device())
+          PY
+          python3 -m mlx_lm.generate --help | sed -n '1,80p'
+          python3 -m mlx_lm.benchmark --help | sed -n '1,120p'
+
+      - name: Create custom benchmark script
+        run: |
+          cat > bench_generate.py <<'PY'
+          import argparse
+          import statistics
+          import time
+
+          from mlx_lm import generate, load
+
+
+          def encode_len(tokenizer, text):
+              encoded = tokenizer.encode(text)
+              return len(encoded)
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--model", required=True)
+              parser.add_argument("--prompt", default="The future of computing is")
+              parser.add_argument("--max-tokens", type=int, default=512)
+              parser.add_argument("--warmup", type=int, default=1)
+              parser.add_argument("--runs", type=int, default=5)
+              args = parser.parse_args()
+
+              print(f"MODEL={args.model}")
+              model, tokenizer = load(args.model)
+
+              for i in range(args.warmup):
+                  _ = generate(
+                      model,
+                      tokenizer,
+                      prompt=args.prompt,
+                      max_tokens=32,
+                      verbose=False,
+                  )
+                  print(f"warmup={i + 1} done")
+
+              speeds = []
+              for i in range(args.runs):
+                  start = time.perf_counter()
+                  text = generate(
+                      model,
+                      tokenizer,
+                      prompt=args.prompt,
+                      max_tokens=args.max_tokens,
+                      verbose=False,
+                  )
+                  elapsed = time.perf_counter() - start
+                  out_tokens = encode_len(tokenizer, text)
+                  tok_s = out_tokens / elapsed if elapsed > 0 else 0.0
+                  speeds.append(tok_s)
+                  print(
+                      f"run={i + 1} output_tokens={out_tokens} "
+                      f"seconds={elapsed:.4f} tok_s={tok_s:.2f}"
+                  )
+
+              print(f"BEST_TOK_S={max(speeds):.2f}")
+              print(f"AVG_TOK_S={statistics.mean(speeds):.2f}")
+              print(f"MEDIAN_TOK_S={statistics.median(speeds):.2f}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Benchmark SmolLM 135M base with mlx_lm.benchmark
+        run: |
+          set -eux
+          python3 -m mlx_lm.benchmark \
+            --model mlx-community/SmolLM-135M-4bit \
+            -p "${{ github.event.inputs.prompt_tokens }}" \
+            -g "${{ github.event.inputs.generation_tokens }}" \
+            2>&1 | tee smollm_135m_4bit_mlx_lm_benchmark.txt
+
+      - name: Benchmark SmolLM 135M Instruct with mlx_lm.benchmark
+        run: |
+          set -eux
+          python3 -m mlx_lm.benchmark \
+            --model mlx-community/SmolLM-135M-Instruct-4bit \
+            -p "${{ github.event.inputs.prompt_tokens }}" \
+            -g "${{ github.event.inputs.generation_tokens }}" \
+            2>&1 | tee smollm_135m_instruct_4bit_mlx_lm_benchmark.txt
+
+      - name: Benchmark SmolLM 135M base with custom wall-clock script
+        run: |
+          set -eux
+          python3 bench_generate.py \
+            --model mlx-community/SmolLM-135M-4bit \
+            --prompt "The future of computing is" \
+            --max-tokens "${{ github.event.inputs.generation_tokens }}" \
+            --runs "${{ github.event.inputs.repetitions }}" \
+            2>&1 | tee smollm_135m_4bit_custom_benchmark.txt
+
+      - name: Benchmark SmolLM 135M Instruct with custom wall-clock script
+        run: |
+          set -eux
+          python3 bench_generate.py \
+            --model mlx-community/SmolLM-135M-Instruct-4bit \
+            --prompt "Tell a short story about a robot." \
+            --max-tokens "${{ github.event.inputs.generation_tokens }}" \
+            --runs "${{ github.event.inputs.repetitions }}" \
+            2>&1 | tee smollm_135m_instruct_4bit_custom_benchmark.txt
+
+      - name: Inspect NanoGPT-on-MLX TinyStories candidate
+        continue-on-error: true
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/JackSuuu/nanoGPT-on-MLX.git nanogpt-on-mlx
+          find nanogpt-on-mlx -maxdepth 3 -type f | sort | tee nanogpt_repo_files.txt
+          find nanogpt-on-mlx -maxdepth 3 -type f \
+            \( -name '*bench*' -o -name '*sample*' -o -name '*generate*' -o -name '*.py' \) \
+            -print | sort | tee nanogpt_candidate_scripts.txt
+
+      - name: Try NanoGPT TinyStories generation or benchmark scripts
+        continue-on-error: true
+        working-directory: nanogpt-on-mlx
+        run: |
+          set -eux
+          if [ -f sample.py ]; then
+            python3 sample.py 2>&1 | tee ../nanogpt_sample_output.txt
+          elif [ -f generate.py ]; then
+            python3 generate.py 2>&1 | tee ../nanogpt_generate_output.txt
+          elif [ -f benchmark.py ]; then
+            python3 benchmark.py 2>&1 | tee ../nanogpt_benchmark_output.txt
+          else
+            echo "No obvious sample.py/generate.py/benchmark.py found. See nanogpt_candidate_scripts.txt." | tee ../nanogpt_no_entrypoint.txt
+          fi
+
+      - name: Summarize results
+        if: always()
+        run: |
+          set +e
+          echo "# MLX Tiny LLM Benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          uname -a >> "$GITHUB_STEP_SUMMARY"
+          sw_vers >> "$GITHUB_STEP_SUMMARY"
+          sysctl -n machdep.cpu.brand_string >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          sysctl -n hw.memsize >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## SmolLM custom benchmark highlights" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -hE 'MODEL=|BEST_TOK_S=|AVG_TOK_S=|MEDIAN_TOK_S=' *_custom_benchmark.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## mlx_lm.benchmark raw output highlights" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -hEi 'prompt|generation|tok|tokens|speed' *_mlx_lm_benchmark.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## NanoGPT TinyStories" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f nanogpt_candidate_scripts.txt ]; then
+            sed -n '1,80p' nanogpt_candidate_scripts.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f nanogpt_no_entrypoint.txt ]; then
+            cat nanogpt_no_entrypoint.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-tiny-llm-benchmark-results
+          path: |
+            *.txt
+            bench_generate.py

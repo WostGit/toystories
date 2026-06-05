@@ -2,26 +2,25 @@ name: MLX Tiny LLM Benchmark
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
     inputs:
       prompt_tokens:
-        description: "Prompt token count for mlx_lm.benchmark"
+        description: Prompt tokens for mlx_lm.benchmark
         required: false
         default: "32"
       generation_tokens:
-        description: "Generation token count for mlx_lm.benchmark/custom benchmark"
+        description: Generation tokens
         required: false
         default: "512"
       repetitions:
-        description: "Benchmark repetitions"
+        description: Custom benchmark repetitions
         required: false
         default: "5"
 
 jobs:
-  mlx-tiny-bench:
-    name: Benchmark tiny MLX models on macos-26
+  bench:
+    name: Benchmark MLX tiny models on macos-26
     runs-on: macos-26
     timeout-minutes: 45
     env:
@@ -30,8 +29,7 @@ jobs:
       REPETITIONS: ${{ github.event.inputs.repetitions || '5' }}
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: System info
         run: |
@@ -43,140 +41,69 @@ jobs:
           sysctl -n hw.ncpu || true
           python3 --version
 
-      - name: Create virtual environment and install MLX dependencies
+      - name: Install dependencies in venv
         run: |
           set -eux
           python3 -m venv .venv
           .venv/bin/python -m pip install --upgrade pip setuptools wheel
-          .venv/bin/python -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm
+          .venv/bin/python -m pip install --upgrade mlx mlx-lm huggingface_hub numpy tiktoken tqdm datasets
 
-      - name: Version info
-        run: |
-          set -eux
-          .venv/bin/python --version
-          .venv/bin/python - <<'PY'
-          import platform
-          import mlx.core as mx
-          print("platform=", platform.platform())
-          print("mlx_default_device=", mx.default_device())
-          PY
-          .venv/bin/python -m mlx_lm.generate --help | sed -n '1,80p'
-          .venv/bin/python -m mlx_lm.benchmark --help | sed -n '1,120p'
-
-      - name: Create custom benchmark script
+      - name: Create MLX-LM custom benchmark script
         run: |
           cat > bench_generate.py <<'PY'
           import argparse
           import statistics
           import time
-
           from mlx_lm import generate, load
 
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--model", required=True)
+          parser.add_argument("--prompt", default="The future of computing is")
+          parser.add_argument("--max-tokens", type=int, default=512)
+          parser.add_argument("--runs", type=int, default=5)
+          args = parser.parse_args()
 
-          def encode_len(tokenizer, text):
-              encoded = tokenizer.encode(text)
-              return len(encoded)
+          model, tokenizer = load(args.model)
+          generate(model, tokenizer, prompt=args.prompt, max_tokens=16, verbose=False)
 
+          speeds = []
+          for i in range(args.runs):
+              start = time.perf_counter()
+              text = generate(model, tokenizer, prompt=args.prompt, max_tokens=args.max_tokens, verbose=False)
+              elapsed = time.perf_counter() - start
+              tokens = len(tokenizer.encode(text))
+              tok_s = tokens / elapsed
+              speeds.append(tok_s)
+              print(f"run={i+1} output_tokens={tokens} seconds={elapsed:.4f} tok_s={tok_s:.2f}")
 
-          def main():
-              parser = argparse.ArgumentParser()
-              parser.add_argument("--model", required=True)
-              parser.add_argument("--prompt", default="The future of computing is")
-              parser.add_argument("--max-tokens", type=int, default=512)
-              parser.add_argument("--warmup", type=int, default=1)
-              parser.add_argument("--runs", type=int, default=5)
-              args = parser.parse_args()
-
-              print(f"MODEL={args.model}")
-              model, tokenizer = load(args.model)
-
-              for i in range(args.warmup):
-                  _ = generate(
-                      model,
-                      tokenizer,
-                      prompt=args.prompt,
-                      max_tokens=32,
-                      verbose=False,
-                  )
-                  print(f"warmup={i + 1} done")
-
-              speeds = []
-              for i in range(args.runs):
-                  start = time.perf_counter()
-                  text = generate(
-                      model,
-                      tokenizer,
-                      prompt=args.prompt,
-                      max_tokens=args.max_tokens,
-                      verbose=False,
-                  )
-                  elapsed = time.perf_counter() - start
-                  out_tokens = encode_len(tokenizer, text)
-                  tok_s = out_tokens / elapsed if elapsed > 0 else 0.0
-                  speeds.append(tok_s)
-                  print(
-                      f"run={i + 1} output_tokens={out_tokens} "
-                      f"seconds={elapsed:.4f} tok_s={tok_s:.2f}"
-                  )
-
-              print(f"BEST_TOK_S={max(speeds):.2f}")
-              print(f"AVG_TOK_S={statistics.mean(speeds):.2f}")
-              print(f"MEDIAN_TOK_S={statistics.median(speeds):.2f}")
-
-
-          if __name__ == "__main__":
-              main()
+          print(f"MODEL={args.model}")
+          print(f"BEST_TOK_S={max(speeds):.2f}")
+          print(f"AVG_TOK_S={statistics.mean(speeds):.2f}")
+          print(f"MEDIAN_TOK_S={statistics.median(speeds):.2f}")
           PY
 
-      - name: Benchmark SmolLM 135M base with mlx_lm.benchmark
+      - name: Benchmark SmolLM 135M base
         run: |
           set -eux
-          .venv/bin/python -m mlx_lm.benchmark \
-            --model mlx-community/SmolLM-135M-4bit \
-            -p "$PROMPT_TOKENS" \
-            -g "$GENERATION_TOKENS" \
-            2>&1 | tee smollm_135m_4bit_mlx_lm_benchmark.txt
+          .venv/bin/python -m mlx_lm.benchmark --model mlx-community/SmolLM-135M-4bit -p "$PROMPT_TOKENS" -g "$GENERATION_TOKENS" 2>&1 | tee smollm_135m_4bit_mlx_lm_benchmark.txt
+          .venv/bin/python bench_generate.py --model mlx-community/SmolLM-135M-4bit --prompt "The future of computing is" --max-tokens "$GENERATION_TOKENS" --runs "$REPETITIONS" 2>&1 | tee smollm_135m_4bit_custom_benchmark.txt
 
-      - name: Benchmark SmolLM 135M Instruct with mlx_lm.benchmark
+      - name: Benchmark SmolLM 135M Instruct
         run: |
           set -eux
-          .venv/bin/python -m mlx_lm.benchmark \
-            --model mlx-community/SmolLM-135M-Instruct-4bit \
-            -p "$PROMPT_TOKENS" \
-            -g "$GENERATION_TOKENS" \
-            2>&1 | tee smollm_135m_instruct_4bit_mlx_lm_benchmark.txt
+          .venv/bin/python -m mlx_lm.benchmark --model mlx-community/SmolLM-135M-Instruct-4bit -p "$PROMPT_TOKENS" -g "$GENERATION_TOKENS" 2>&1 | tee smollm_135m_instruct_4bit_mlx_lm_benchmark.txt
+          .venv/bin/python bench_generate.py --model mlx-community/SmolLM-135M-Instruct-4bit --prompt "Tell a short story about a robot." --max-tokens "$GENERATION_TOKENS" --runs "$REPETITIONS" 2>&1 | tee smollm_135m_instruct_4bit_custom_benchmark.txt
 
-      - name: Benchmark SmolLM 135M base with custom wall-clock script
-        run: |
-          set -eux
-          .venv/bin/python bench_generate.py \
-            --model mlx-community/SmolLM-135M-4bit \
-            --prompt "The future of computing is" \
-            --max-tokens "$GENERATION_TOKENS" \
-            --runs "$REPETITIONS" \
-            2>&1 | tee smollm_135m_4bit_custom_benchmark.txt
-
-      - name: Benchmark SmolLM 135M Instruct with custom wall-clock script
-        run: |
-          set -eux
-          .venv/bin/python bench_generate.py \
-            --model mlx-community/SmolLM-135M-Instruct-4bit \
-            --prompt "Tell a short story about a robot." \
-            --max-tokens "$GENERATION_TOKENS" \
-            --runs "$REPETITIONS" \
-            2>&1 | tee smollm_135m_instruct_4bit_custom_benchmark.txt
-
-      - name: Clone NanoGPT-on-MLX TinyStories candidate
+      - name: Clone NanoGPT-on-MLX
         run: |
           set -eux
           git clone --depth 1 https://github.com/JackSuuu/nanoGPT-on-MLX.git nanogpt-on-mlx
           find nanogpt-on-mlx -maxdepth 3 -type f | sort | tee nanogpt_repo_files.txt
-          find nanogpt-on-mlx -maxdepth 3 -type f \
-            \( -name '*bench*' -o -name '*sample*' -o -name '*generate*' -o -name '*.py' \) \
-            -print | sort | tee nanogpt_candidate_scripts.txt
 
       - name: Create random NanoGPT checkpoint
         working-directory: nanogpt-on-mlx
+        env:
+          PYTHONPATH: ${{ github.workspace }}/nanogpt-on-mlx
         run: |
           set -eux
           ../.venv/bin/python - <<'PY' 2>&1 | tee ../nanogpt_create_checkpoint.txt
@@ -187,78 +114,50 @@ jobs:
           from src.model import create_model
           from src.utils import count_parameters
 
-          config = {k: v for k, v in vars(cfg).items() if not k.startswith('_')}
-          os.makedirs('checkpoints', exist_ok=True)
+          config = {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
+          os.makedirs("checkpoints", exist_ok=True)
           model = create_model(config)
-
-          # Force lazy parameter initialization before saving.
-          x = mx.random.randint(0, config['vocab_size'], (1, 8))
+          x = mx.random.randint(0, config["vocab_size"], (1, 8))
           logits, _ = model(x)
           mx.eval(logits)
-
           params = count_parameters(model)
-          checkpoint_path = 'checkpoints/checkpoint_0.npz'
+          checkpoint_path = "checkpoints/checkpoint_0.npz"
           model.save_weights(checkpoint_path)
-
-          with open('checkpoints/checkpoint_0_meta.json', 'w') as f:
-              json.dump({'iteration': 0, 'loss': 0.0, 'config': config, 'params': params}, f, indent=2)
-          with open('checkpoints/config.json', 'w') as f:
+          with open("checkpoints/checkpoint_0_meta.json", "w") as f:
+              json.dump({"iteration": 0, "loss": 0.0, "config": config, "params": params}, f, indent=2)
+          with open("checkpoints/config.json", "w") as f:
               json.dump(config, f, indent=2)
-
-          print(f'NANOGPT_CHECKPOINT={checkpoint_path}')
-          print(f'NANOGPT_PARAMS={params}')
+          print(f"NANOGPT_CHECKPOINT={checkpoint_path}")
+          print(f"NANOGPT_PARAMS={params}")
           PY
 
-      - name: Run NanoGPT TinyStories generation
+      - name: Run NanoGPT generation
         working-directory: nanogpt-on-mlx
+        env:
+          PYTHONPATH: ${{ github.workspace }}/nanogpt-on-mlx
         run: |
           set -eux
-          ../.venv/bin/python -m src.generate \
-            --checkpoint checkpoints/checkpoint_0.npz \
-            --prompt "Once upon a time" \
-            --max_tokens 64 \
-            --temperature 0.0 \
-            --top_k 1 \
-            2>&1 | tee ../nanogpt_generate_output.txt
+          ../.venv/bin/python -m src.generate --checkpoint checkpoints/checkpoint_0.npz --prompt "Once upon a time" --max_tokens 64 --temperature 1.0 --top_k 1 2>&1 | tee ../nanogpt_generate_output.txt
 
-      - name: Benchmark NanoGPT TinyStories throughput
+      - name: Benchmark NanoGPT throughput
         working-directory: nanogpt-on-mlx
+        env:
+          PYTHONPATH: ${{ github.workspace }}/nanogpt-on-mlx
         run: |
           set -eux
-          ../.venv/bin/python eval/throughput.py \
-            --checkpoint checkpoints/checkpoint_0.npz \
-            --batch_size 1 \
-            --seq_length 32 \
-            --iterations 5 \
-            --warmup 1 \
-            --generation \
-            2>&1 | tee ../nanogpt_throughput_output.txt
+          ../.venv/bin/python eval/throughput.py --checkpoint checkpoints/checkpoint_0.npz --batch_size 1 --seq_length 32 --iterations 5 --warmup 1 --generation 2>&1 | tee ../nanogpt_throughput_output.txt
 
       - name: Summarize results
         if: always()
         run: |
           set +e
           echo "# MLX Tiny LLM Benchmark" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          uname -a >> "$GITHUB_STEP_SUMMARY"
-          sw_vers >> "$GITHUB_STEP_SUMMARY"
-          sysctl -n machdep.cpu.brand_string >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
-          sysctl -n hw.memsize >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## SmolLM custom benchmark highlights" >> "$GITHUB_STEP_SUMMARY"
+          echo "## SmolLM" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -hE 'MODEL=|BEST_TOK_S=|AVG_TOK_S=|MEDIAN_TOK_S=' *_custom_benchmark.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## mlx_lm.benchmark raw output highlights" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -hEi 'prompt|generation|tok|tokens|speed' *_mlx_lm_benchmark.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## NanoGPT TinyStories" >> "$GITHUB_STEP_SUMMARY"
+          echo "## NanoGPT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -hE 'NANOGPT_CHECKPOINT=|NANOGPT_PARAMS=|Throughput:|Generation Results|tok/s|tokens/sec' nanogpt_create_checkpoint.txt nanogpt_generate_output.txt nanogpt_throughput_output.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo '```' >> "$GITHUB_STEP_SUMMARY"

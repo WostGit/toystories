@@ -1,6 +1,9 @@
 name: MLX Tiny LLM Benchmark
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       prompt_tokens:
@@ -21,6 +24,10 @@ jobs:
     name: Benchmark tiny MLX models on macos-26
     runs-on: macos-26
     timeout-minutes: 45
+    env:
+      PROMPT_TOKENS: ${{ github.event.inputs.prompt_tokens || '32' }}
+      GENERATION_TOKENS: ${{ github.event.inputs.generation_tokens || '512' }}
+      REPETITIONS: ${{ github.event.inputs.repetitions || '5' }}
 
     steps:
       - name: Check out repository
@@ -126,8 +133,8 @@ jobs:
           set -eux
           .venv/bin/python -m mlx_lm.benchmark \
             --model mlx-community/SmolLM-135M-4bit \
-            -p "${{ github.event.inputs.prompt_tokens }}" \
-            -g "${{ github.event.inputs.generation_tokens }}" \
+            -p "$PROMPT_TOKENS" \
+            -g "$GENERATION_TOKENS" \
             2>&1 | tee smollm_135m_4bit_mlx_lm_benchmark.txt
 
       - name: Benchmark SmolLM 135M Instruct with mlx_lm.benchmark
@@ -135,8 +142,8 @@ jobs:
           set -eux
           .venv/bin/python -m mlx_lm.benchmark \
             --model mlx-community/SmolLM-135M-Instruct-4bit \
-            -p "${{ github.event.inputs.prompt_tokens }}" \
-            -g "${{ github.event.inputs.generation_tokens }}" \
+            -p "$PROMPT_TOKENS" \
+            -g "$GENERATION_TOKENS" \
             2>&1 | tee smollm_135m_instruct_4bit_mlx_lm_benchmark.txt
 
       - name: Benchmark SmolLM 135M base with custom wall-clock script
@@ -145,8 +152,8 @@ jobs:
           .venv/bin/python bench_generate.py \
             --model mlx-community/SmolLM-135M-4bit \
             --prompt "The future of computing is" \
-            --max-tokens "${{ github.event.inputs.generation_tokens }}" \
-            --runs "${{ github.event.inputs.repetitions }}" \
+            --max-tokens "$GENERATION_TOKENS" \
+            --runs "$REPETITIONS" \
             2>&1 | tee smollm_135m_4bit_custom_benchmark.txt
 
       - name: Benchmark SmolLM 135M Instruct with custom wall-clock script
@@ -155,8 +162,8 @@ jobs:
           .venv/bin/python bench_generate.py \
             --model mlx-community/SmolLM-135M-Instruct-4bit \
             --prompt "Tell a short story about a robot." \
-            --max-tokens "${{ github.event.inputs.generation_tokens }}" \
-            --runs "${{ github.event.inputs.repetitions }}" \
+            --max-tokens "$GENERATION_TOKENS" \
+            --runs "$REPETITIONS" \
             2>&1 | tee smollm_135m_instruct_4bit_custom_benchmark.txt
 
       - name: Inspect NanoGPT-on-MLX TinyStories candidate
